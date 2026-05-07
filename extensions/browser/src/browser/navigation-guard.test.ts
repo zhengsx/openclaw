@@ -420,5 +420,108 @@ describe("browser navigation guard", () => {
       ).rejects.toBeInstanceOf(SsrFBlockedError);
       expect(lookupFn).toHaveBeenCalled();
     });
+
+    // Codex review #77913 P1: strict-mode SSRF policy must still be enforced
+    // in external-browser-proxy mode. The Node-side DNS pinning is skipped,
+    // but hostname-policy gates (IP-literal requirement, explicit allowlist)
+    // apply equally because they do not depend on where Node thinks the
+    // hostname resolves.
+    it("blocks non-allowlisted hostnames in strict mode (dangerouslyAllowPrivateNetwork: false)", async () => {
+      const lookupFn = createLookupFn("93.184.216.34");
+      await expect(
+        assertBrowserNavigationAllowed({
+          url: "https://example.com",
+          browserProxyMode: "external-browser-proxy",
+          ssrfPolicy: { dangerouslyAllowPrivateNetwork: false },
+          lookupFn,
+        }),
+      ).rejects.toThrow(/dns rebinding protections are unavailable/i);
+      expect(lookupFn).not.toHaveBeenCalled();
+    });
+
+    it("allows explicitly allowed hostnames in strict mode", async () => {
+      const lookupFn = createLookupFn("192.168.42.1");
+      await expect(
+        assertBrowserNavigationAllowed({
+          url: "https://agent.internal",
+          browserProxyMode: "external-browser-proxy",
+          ssrfPolicy: {
+            dangerouslyAllowPrivateNetwork: false,
+            allowedHostnames: ["agent.internal"],
+          },
+          lookupFn,
+        }),
+      ).resolves.toBeUndefined();
+      expect(lookupFn).not.toHaveBeenCalled();
+    });
+
+    it("allows wildcard-allowlisted hostnames in strict mode", async () => {
+      const lookupFn = createLookupFn("192.168.42.1");
+      await expect(
+        assertBrowserNavigationAllowed({
+          url: "https://sub.example.com",
+          browserProxyMode: "external-browser-proxy",
+          ssrfPolicy: {
+            dangerouslyAllowPrivateNetwork: false,
+            hostnameAllowlist: ["*.example.com"],
+          },
+          lookupFn,
+        }),
+      ).resolves.toBeUndefined();
+      expect(lookupFn).not.toHaveBeenCalled();
+    });
+
+    it("does not match sibling domains against wildcard allowlist entries in strict mode", async () => {
+      const lookupFn = createLookupFn("192.168.42.1");
+      await expect(
+        assertBrowserNavigationAllowed({
+          url: "https://evil-example.com",
+          browserProxyMode: "external-browser-proxy",
+          ssrfPolicy: {
+            dangerouslyAllowPrivateNetwork: false,
+            hostnameAllowlist: ["*.example.com"],
+          },
+          lookupFn,
+        }),
+      ).rejects.toThrow(/dns rebinding protections are unavailable/i);
+      expect(lookupFn).not.toHaveBeenCalled();
+    });
+
+    it("honors explicit allowlist for denylisted hostnames, matching direct-mode semantics", async () => {
+      // direct-mode allows `agent.internal` when `allowedHostnames` explicitly
+      // names it (the hostname ends in `.internal` which is on the intrinsic
+      // denylist, but explicit user opt-in takes precedence — see
+      // "allows blocked hostnames when explicitly allowed" test above).
+      // external-browser-proxy should match that semantics to avoid a stricter-
+      // than-direct surprise.
+      const lookupFn = createLookupFn("169.254.169.254");
+      await expect(
+        assertBrowserNavigationAllowed({
+          url: "http://metadata.google.internal/computeMetadata/v1/",
+          browserProxyMode: "external-browser-proxy",
+          ssrfPolicy: {
+            allowedHostnames: ["metadata.google.internal"],
+          },
+          lookupFn,
+        }),
+      ).resolves.toBeUndefined();
+      expect(lookupFn).not.toHaveBeenCalled();
+    });
+
+    it("allows IP-literal URLs in strict mode with private-network opt-in", async () => {
+      // Strict mode with dangerouslyAllowPrivateNetwork: true treats the
+      // allowlist as authoritative regardless of reachability. This is the
+      // "trust the host browser's proxy" configuration.
+      const lookupFn = createLookupFn("93.184.216.34");
+      await expect(
+        assertBrowserNavigationAllowed({
+          url: "https://example.com",
+          browserProxyMode: "external-browser-proxy",
+          ssrfPolicy: { dangerouslyAllowPrivateNetwork: true },
+          lookupFn,
+        }),
+      ).resolves.toBeUndefined();
+      expect(lookupFn).not.toHaveBeenCalled();
+    });
   });
 });

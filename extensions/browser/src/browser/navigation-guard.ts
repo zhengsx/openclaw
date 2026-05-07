@@ -125,15 +125,29 @@ export async function assertBrowserNavigationAllowed(
   // for example, a split-tunnel VPN can resolve a public hostname to its own
   // loopback proxy IP on the gateway host, while the browser sends the request
   // through the VPN to the real public target. DNS-to-IP SSRF checks are not
-  // meaningful in this configuration. Keep the hostname denylist so cloud
-  // metadata services (`metadata.google.internal`), loopback aliases
-  // (`localhost`), and reserved TLDs (`*.local`, `*.internal`, `*.localhost`)
-  // are still rejected as defense-in-depth.
-  if (opts.browserProxyMode === "external-browser-proxy") {
-    if (isBlockedHostnameOrIp(parsed.hostname)) {
-      throw new SsrFBlockedError(`Blocked hostname: ${parsed.hostname}`);
-    }
-    return;
+  // meaningful in this configuration, so we skip the Node-side DNS resolve
+  // step. All hostname-based policy gates — intrinsic denylist, IP-literal
+  // private-address blocking, strict-mode allowlist enforcement — still run
+  // because they do not depend on where Node thinks the hostname resolves.
+  const skipDnsResolution = opts.browserProxyMode === "external-browser-proxy";
+
+  // Intrinsic denylist: cloud metadata services (`metadata.google.internal`),
+  // loopback aliases (`localhost`), reserved TLDs (`*.local`, `*.internal`,
+  // `*.localhost`), and IP-literal private addresses written directly in the
+  // URL. Applied in external-browser-proxy mode as defense-in-depth (the
+  // default `direct` path relies on `resolvePinnedHostnameWithPolicy` for
+  // equivalent coverage).
+  //
+  // Explicit allowlist opt-in: consistent with the direct-mode policy shape,
+  // a hostname explicitly named in `ssrfPolicy.allowedHostnames` or matching
+  // `ssrfPolicy.hostnameAllowlist` bypasses the intrinsic denylist. The user
+  // has declared informed consent for that specific host.
+  if (
+    skipDnsResolution &&
+    isBlockedHostnameOrIp(parsed.hostname) &&
+    !isExplicitlyAllowedBrowserHostname(parsed.hostname, opts.ssrfPolicy)
+  ) {
+    throw new SsrFBlockedError(`Blocked hostname: ${parsed.hostname}`);
   }
 
   // Browser proxy routing hides the final connect target from this process.
@@ -151,7 +165,10 @@ export async function assertBrowserNavigationAllowed(
   // Browser navigations happen in Chromium's network stack, not Node's. In
   // strict mode, a hostname-based URL would be resolved twice by different
   // resolvers, so Node-side pinning cannot guarantee the browser connects to
-  // the same address that passed policy checks.
+  // the same address that passed policy checks. External-browser-proxy shares
+  // this constraint: the host browser's resolver is not observable here. In
+  // both cases, strict-mode navigation must either use an IP literal or hit an
+  // explicit hostname allowlist entry.
   if (
     opts.ssrfPolicy &&
     opts.ssrfPolicy.dangerouslyAllowPrivateNetwork === false &&
@@ -162,6 +179,10 @@ export async function assertBrowserNavigationAllowed(
     throw new InvalidBrowserNavigationUrlError(
       "Navigation blocked: strict browser SSRF policy requires an IP-literal URL because browser DNS rebinding protections are unavailable for hostname-based navigation",
     );
+  }
+
+  if (skipDnsResolution) {
+    return;
   }
 
   await resolvePinnedHostnameWithPolicy(parsed.hostname, {
